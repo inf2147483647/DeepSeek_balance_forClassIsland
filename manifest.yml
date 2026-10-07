@@ -1,0 +1,14 @@
+﻿﻿# nonk8s
+# 插件清单文件使用 YAML 格式存储。
+# 插件清单格式：https://docs.classisland.tech/dev/plugins/create-project.html
+
+id: deepseekbalance
+name: DeepSeek余额
+description: 在 ClassIsland 主界面显示 DeepSeek API 账户余额。支持管理多个 API 密钥，余额变动时数字闪烁提示。
+entranceAssembly: "DeepSeekBalance.dll"
+url: https://github.com/inf2147483647/DeepSeek_balance
+version: 0.1.0.0
+apiVersion: 2.1.1.1
+author: inf2147483647
+icon: icon.png
+readme: README.md
