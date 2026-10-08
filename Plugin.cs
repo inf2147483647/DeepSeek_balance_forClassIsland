@@ -1,4 +1,4 @@
-﻿﻿using ClassIsland.Core.Abstractions;
+﻿using ClassIsland.Core.Abstractions;
 using ClassIsland.Core.Attributes;
 using ClassIsland.Core.Extensions.Registry;
 using DeepSeekBalance.Components;

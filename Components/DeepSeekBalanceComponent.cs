@@ -1,7 +1,8 @@
-﻿﻿using System;
+﻿using System;
 using System.Linq;
 using System.Threading.Tasks;
 using Avalonia;
+using Avalonia.Animation;
 using Avalonia.Controls;
 using Avalonia.Layout;
 using Avalonia.Media;
@@ -20,27 +21,36 @@ namespace DeepSeekBalance.Components;
 [ComponentInfo(
     "8F2A1C33-6B47-4D92-9E10-5C7A3D4B6E21",
     "DeepSeek余额",
-    "\uF550",
-    "显示 DeepSeek API 账户余额，每 0.5 秒刷新一次。余额减少时闪红，充值时闪绿。")]
+    "",
+    "显示 DeepSeek API 账户余额，每 20 秒刷新一次。余额减少时闪红，充值时闪绿，随后以 0.5 秒过渡动画恢复原色。")]
 public class DeepSeekBalanceComponent : ComponentBase<DeepSeekComponentSettings>
 {
-    private static readonly TimeSpan RefreshInterval = TimeSpan.FromSeconds(0.5);
-    private static readonly TimeSpan FlashInterval = TimeSpan.FromMilliseconds(200);
+    private static readonly TimeSpan RefreshInterval = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan ColorTransitionDuration = TimeSpan.FromSeconds(0.5);
     private static readonly IBrush DecreaseBrush = new SolidColorBrush(Color.Parse("#E53935"));
     private static readonly IBrush IncreaseBrush = new SolidColorBrush(Color.Parse("#43A047"));
 
     private readonly TextBlock _balanceText;
     private readonly DispatcherTimer _refreshTimer;
-    private readonly DispatcherTimer _flashTimer;
+    private readonly Transitions _foregroundTransitions;
 
     private decimal? _lastBalance;
     private bool _isRefreshing;
-    private IBrush? _flashBrush;
-    private int _flashTicks;
     private bool _themeSubscribed;
 
     public DeepSeekBalanceComponent()
     {
+        // Foreground 的过渡动画：余额变化后由红/绿恢复为主题原色时，
+        // 由 Avalonia 在 0.5 秒内完成颜色插值（非阻塞，不占用 UI 线程）。
+        _foregroundTransitions = new Transitions
+        {
+            new BrushTransition
+            {
+                Property = TextBlock.ForegroundProperty,
+                Duration = ColorTransitionDuration
+            }
+        };
+
         _balanceText = new TextBlock
         {
             Text = "余额：--CNY",
@@ -52,9 +62,6 @@ public class DeepSeekBalanceComponent : ComponentBase<DeepSeekComponentSettings>
         _refreshTimer = new DispatcherTimer { Interval = RefreshInterval };
         _refreshTimer.Tick += OnRefreshTick;
 
-        _flashTimer = new DispatcherTimer { Interval = FlashInterval };
-        _flashTimer.Tick += OnFlashTick;
-
         AttachedToVisualTree += (_, _) => OnAttached();
         DetachedFromVisualTree += (_, _) => OnDetached();
     }
@@ -65,14 +72,13 @@ public class DeepSeekBalanceComponent : ComponentBase<DeepSeekComponentSettings>
     {
         SubscribeTheme();
         _refreshTimer.Start();
+        // 立即刷新一次，避免挂载后等待整整 20 秒才显示余额。
+        _ = RefreshSafeAsync();
     }
 
     private void OnDetached()
     {
         _refreshTimer.Stop();
-        _flashTimer.Stop();
-        _flashBrush = null;
-        ApplyFlash(null);
         UnsubscribeTheme();
     }
 
@@ -100,13 +106,12 @@ public class DeepSeekBalanceComponent : ComponentBase<DeepSeekComponentSettings>
 
     private void OnThemeVariantChanged(object? sender, EventArgs e)
     {
-        if (_flashBrush is null)
-        {
-            _balanceText.Foreground = ThemeHelper.GetTextBrush();
-        }
+        _balanceText.Foreground = ThemeHelper.GetTextBrush();
     }
 
-    private async void OnRefreshTick(object? sender, EventArgs e)
+    private async void OnRefreshTick(object? sender, EventArgs e) => await RefreshSafeAsync();
+
+    private async Task RefreshSafeAsync()
     {
         if (_isRefreshing)
         {
@@ -161,37 +166,25 @@ public class DeepSeekBalanceComponent : ComponentBase<DeepSeekComponentSettings>
 
         if (previous.HasValue && balance.Value != previous.Value)
         {
-            StartFlash(balance.Value < previous.Value ? DecreaseBrush : IncreaseBrush);
+            FlashAndRecover(balance.Value < previous.Value ? DecreaseBrush : IncreaseBrush);
         }
-    }
-
-    private void StartFlash(IBrush brush)
-    {
-        _flashBrush = brush;
-        _flashTicks = 0;
-        ApplyFlash(brush);
-        _flashTimer.Start();
-    }
-
-    private void OnFlashTick(object? sender, EventArgs e)
-    {
-        _flashTicks++;
-        if (_flashTicks >= 6)
-        {
-            _flashTimer.Stop();
-            _flashBrush = null;
-            ApplyFlash(null);
-            return;
-        }
-
-        ApplyFlash(_flashTicks % 2 == 0 ? _flashBrush : null);
     }
 
     /// <summary>
-    /// 应用闪烁颜色。传入 null 时恢复为随主题变化的默认前景色。
+    /// 文本颜色瞬间变为红/绿，随后以 0.5 秒过渡动画恢复为随主题变化的默认前景色。
     /// </summary>
-    private void ApplyFlash(IBrush? brush)
+    private void FlashAndRecover(IBrush flashBrush)
     {
-        _balanceText.Foreground = brush ?? ThemeHelper.GetTextBrush();
+        // 暂时停用过渡，让颜色瞬间切换为红/绿。
+        _balanceText.Transitions = null;
+        _balanceText.Foreground = flashBrush;
+
+        // 下一帧重新启用过渡并写回原色：Avalonia 会从当前颜色（红/绿）
+        // 在 0.5 秒内插值到主题原色，动画由渲染系统驱动，不阻塞 UI。
+        Dispatcher.UIThread.Post(() =>
+        {
+            _balanceText.Transitions = _foregroundTransitions;
+            _balanceText.Foreground = ThemeHelper.GetTextBrush();
+        });
     }
 }

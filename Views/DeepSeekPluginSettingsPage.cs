@@ -1,4 +1,4 @@
-﻿﻿using System;
+﻿using System;
 using System.Collections.Specialized;
 using Avalonia;
 using Avalonia.Controls;
@@ -62,7 +62,13 @@ public class DeepSeekPluginSettingsPage : SettingsPageBase
         {
             Width = 300,
             PasswordChar = '●',
+#if NET10_0
+            // Avalonia 12（net10/CI 2.1.1.1）将 Watermark 重命名为 PlaceholderText
             PlaceholderText = "sk-...",
+#else
+            // Avalonia 11（net8/CI 2.0.1.1）
+            Watermark = "sk-...",
+#endif
             VerticalAlignment = VerticalAlignment.Center
         };
 
@@ -168,7 +174,7 @@ public class DeepSeekPluginSettingsPage : SettingsPageBase
 
         _footerHint = new TextBlock
         {
-            Text = "提示：API 密钥以明文形式保存在插件配置目录中，请注意保管。",
+            Text = "提示：API 密钥经 Windows 数据保护（DPAPI）加密后保存在当前用户注册表（HKCU\\Software\\DeepSeekBalance）中，不以明文存储。",
             TextWrapping = TextWrapping.Wrap,
             Foreground = ThemeHelper.GetSubTextBrush()
         };

@@ -1,4 +1,4 @@
-﻿﻿# nonk8s
+﻿# nonk8s
 # 插件清单文件使用 YAML 格式存储。
 # 插件清单格式：https://docs.classisland.tech/dev/plugins/create-project.html
 
@@ -8,7 +8,10 @@ description: 在 ClassIsland 主界面显示 DeepSeek API 账户余额。支持�
 entranceAssembly: "DeepSeekBalance.dll"
 url: https://github.com/inf2147483647/DeepSeek_balance
 version: 0.1.0.0
-apiVersion: 2.1.1.1
+# 声明最低兼容 API 版本（参考 AdvancedTimeIsland）：
+# net8.0 兼容包基于 2.0.1.1 编译、net10.0 包基于 2.1.1.1 编译，
+# 清单保持 2.0.0.0 可被新旧两种宿主加载。
+apiVersion: 2.0.0.0
 author: inf2147483647
 icon: icon.png
 readme: README.md

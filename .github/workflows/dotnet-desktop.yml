@@ -1,0 +1,55 @@
+name: Build DeepSeekBalance
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Install .NET 8
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 8.0.x
+
+    - name: Install .NET 10
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 10.0.x
+
+    - name: Build and package both variants
+      shell: pwsh
+      run: |
+        .\Build-Package.ps1 -Target both
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+
+    - name: Upload net8.0 compat package
+      uses: actions/upload-artifact@v4
+      with:
+        name: DeepSeekBalance-net8.0-compat.cipx
+        path: cipx/DeepSeekBalance-net8.0-compat.cipx
+        if-no-files-found: error
+
+    - name: Upload net10.0 new package
+      uses: actions/upload-artifact@v4
+      with:
+        name: DeepSeekBalance-net10.0.cipx
+        path: cipx/DeepSeekBalance-net10.0.cipx
+        if-no-files-found: error
+
+    - name: Upload all packages (zip)
+      uses: actions/upload-artifact@v4
+      with:
+        name: DeepSeekBalance-all-cipx
+        path: cipx/*.cipx
+        if-no-files-found: error

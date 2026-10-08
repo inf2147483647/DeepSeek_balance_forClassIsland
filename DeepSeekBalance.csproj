@@ -1,20 +1,44 @@
-﻿﻿<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
-        <TargetFramework>net10.0</TargetFramework>
+        <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
         <LangVersion>latest</LangVersion>
+        <EnableDynamicLoading>true</EnableDynamicLoading>
+        <!-- 不启用 SDK 自带的 cipx 打包（依赖 pwsh），改用 Build-Package.ps1 打包 -->
+        <CreateCipx>false</CreateCipx>
     </PropertyGroup>
 
     <PropertyGroup>
-        <ClassIslandPluginSdkVersion>2.1.1.1</ClassIslandPluginSdkVersion>
+        <!-- 按目标框架选择 SDK（参考 AdvancedTimeIsland）：
+             net10.0（Misha 新版）使用 ClassIsland.PluginSdk/Core 2.1.1.1
+             （2.1.1.1 起档案模型破坏性更改，低于 2.1.1.1 编译的插件无法加载）；
+             net8.0（兼容版，支持旧版 ClassIsland）使用 2.0.1.1
+             （2.0.1.1 仍提供 net8.0 资产；2.1.1 起改为 net10.0 资产）。
+             由 Build-Package.ps1 通过 -p:TargetFramework 切换构建。 -->
+        <ClassIslandPluginSdkVersion Condition="'$(TargetFramework)' == 'net10.0'">2.1.1.1</ClassIslandPluginSdkVersion>
+        <ClassIslandPluginSdkVersion Condition="'$(TargetFramework)' != 'net10.0'">2.0.1.1</ClassIslandPluginSdkVersion>
+    </PropertyGroup>
+
+    <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+        <DebugType>none</DebugType>
+        <DebugSymbols>false</DebugSymbols>
     </PropertyGroup>
 
     <ItemGroup>
         <PackageReference Include="ClassIsland.PluginSdk" Version="$(ClassIslandPluginSdkVersion)">
             <ExcludeAssets>runtime; native</ExcludeAssets>
         </PackageReference>
+        <PackageReference Include="ClassIsland.Core" Version="$(ClassIslandPluginSdkVersion)">
+            <ExcludeAssets>runtime; native</ExcludeAssets>
+        </PackageReference>
+        <!-- API 密钥加密后保存到注册表（HKCU），避免调试时配置文件携带密钥泄露。
+             Microsoft.Win32.Registry 已内置在 net8.0/net10.0 共享框架中，无需额外包引用。 -->
+        <!-- Windows DPAPI（ProtectedData）托管包装：密钥经当前用户凭据加密，
+             同一台机器同一用户才可解密，无需自行管理加密密钥。 -->
+        <PackageReference Condition="'$(TargetFramework)' == 'net10.0'" Include="System.Security.Cryptography.ProtectedData" Version="10.0.12" />
+        <PackageReference Condition="'$(TargetFramework)' != 'net10.0'" Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
     </ItemGroup>
 
     <ItemGroup>
