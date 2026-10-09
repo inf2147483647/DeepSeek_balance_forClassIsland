@@ -1,4 +1,4 @@
-﻿using System;
+﻿﻿﻿using System;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -23,13 +23,19 @@ public static class SecretProtector
     };
 
     /// <summary>
-    /// 加密明文，返回 Base64 编码的密文。非 Windows 平台无法使用 DPAPI，原样返回。
+    /// 加密明文，返回 Base64 编码的密文。
+    /// fail-closed：非 Windows 平台无法使用 DPAPI 时抛出异常，绝不返回明文，
+    /// 避免密文在异常环境下被当作"已加密"内容写回。
     /// </summary>
     public static string Protect(string plainText)
     {
-        if (string.IsNullOrEmpty(plainText) || !OperatingSystem.IsWindows())
+        if (string.IsNullOrEmpty(plainText))
         {
             return plainText;
+        }
+        if (!OperatingSystem.IsWindows())
+        {
+            throw new PlatformNotSupportedException("API 密钥加密依赖 Windows DPAPI，当前平台不支持。");
         }
 
         var data = Encoding.UTF8.GetBytes(plainText);
@@ -38,14 +44,19 @@ public static class SecretProtector
     }
 
     /// <summary>
-    /// 解密 <see cref="Protect"/> 产生的 Base64 密文。非 Windows 平台原样返回。
-    /// 密文损坏、用户或机器不匹配时会抛出异常，由调用方处理。
+    /// 解密 <see cref="Protect"/> 产生的 Base64 密文。
+    /// fail-closed：非 Windows 平台抛出异常。
+    /// 密文损坏、用户或机器不匹配时也会抛出异常，由调用方处理。
     /// </summary>
     public static string Unprotect(string protectedBase64)
     {
-        if (string.IsNullOrEmpty(protectedBase64) || !OperatingSystem.IsWindows())
+        if (string.IsNullOrEmpty(protectedBase64))
         {
             return protectedBase64;
+        }
+        if (!OperatingSystem.IsWindows())
+        {
+            throw new PlatformNotSupportedException("API 密钥解密依赖 Windows DPAPI，当前平台不支持。");
         }
 
         var data = Convert.FromBase64String(protectedBase64);

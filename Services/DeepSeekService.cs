@@ -6,6 +6,7 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using ClassIsland.Shared.Helpers;
 using DeepSeekBalance.Helpers;
@@ -16,8 +17,8 @@ namespace DeepSeekBalance.Services;
 
 /// <summary>
 /// 管理 DeepSeek API 密钥列表，并负责余额查询与配置持久化。
-/// 密钥经 Windows DPAPI（当前用户范围）加密后保存在注册表
-/// HKCU\Software\DeepSeekBalance\Apis 中，不以明文写入磁盘，
+/// 完整密钥与脱敏展示串均经 Windows DPAPI（当前用户范围）加密后保存在注册表
+/// HKCU\Software\DeepSeekBalance\Apis 中，任何密钥相关材料都不以明文写入磁盘，
 /// 避免调试/打包时密钥随文件泄露。
 /// </summary>
 public class DeepSeekService
@@ -26,6 +27,7 @@ public class DeepSeekService
 
     private const string RegistryRootKey = @"Software\DeepSeekBalance";
     private const string RegistryApisKey = "Apis";
+    private const string RegistryBackupKey = "Backup";
     private const string ValueApiKey = "ApiKey";
     private const string ValueMaskedKey = "MaskedKey";
 
@@ -37,6 +39,11 @@ public class DeepSeekService
     private readonly string _legacyConfigPath;
 
     /// <summary>
+    /// 串行化"校验+添加"流程，防止并发调用（如快速双击）绕过去重检查重复添加。
+    /// </summary>
+    private readonly SemaphoreSlim _addLock = new(1, 1);
+
+    /// <summary>
     /// 当前插件设置。
     /// </summary>
     public PluginSettings Settings { get; }
@@ -46,21 +53,39 @@ public class DeepSeekService
         _legacyConfigPath = Path.Combine(configFolder, "Settings.json");
         Settings = new PluginSettings();
 
-        // 先读取旧版本（升级前）落在配置目录中的明文密钥，
-        // 再从注册表加载（含旧版本写入的明文），最后统一迁移：
-        // 旧 JSON 密钥并入注册表、明文密钥重新加密写回，并销毁旧文件。
+        // 加载顺序：
+        //   1) 注册表主键 Apis（含旧版本写入的明文，将在后续重新加密）
+        //   2) Apis 整体缺失（写入中途掉电等）时，从备份键 Backup 恢复
+        //   3) 旧版 Settings.json 迁移、明文重新加密，并销毁旧文件
         var legacy = LoadLegacySettings();
         var hasPlaintextInRegistry = LoadFromRegistry();
+
+        var recoveredFromBackup = false;
+        if (Settings.Apis.Count == 0)
+        {
+            recoveredFromBackup = LoadFromBackup();
+        }
+
         var legacyMigrated = MigrateLegacyIfNeeded(legacy);
 
-        if (hasPlaintextInRegistry && !legacyMigrated)
+        // 合并迁移已在内部执行过 Save；其余需要落盘的情形在此统一保存。
+        if ((hasPlaintextInRegistry || recoveredFromBackup) && !legacyMigrated)
         {
             Save();
         }
     }
 
     /// <summary>
-    /// 将当前密钥列表写入注册表（全量同步）。
+    /// 将当前密钥列表保存到注册表。
+    /// 注册表不支持跨多个子键的事务或原子改名，因此采用等价原子语义的
+    /// "合并 → 备份 → 剪枝"顺序，保证进程在任意时刻异常退出都不会丢失有效配置：
+    /// <list type="number">
+    /// <item>合并（upsert）：逐条创建/覆盖每个当前密钥子键的两个密文值。
+    /// 此阶段结束后，所有需要保留的密钥都已存在且为最新；旧值被覆盖而非先删除。</item>
+    /// <item>备份：把当前集合完整写入 Backup 键，供下次启动 Apis 整体缺失时恢复。</item>
+    /// <item>剪枝（prune）：最后删除已不在列表中的陈旧子键。
+    /// 此阶段崩溃最坏只遗留一条陈旧（仍有效加密）的密钥，不会丢失任何需要的密钥。</item>
+    /// </list>
     /// </summary>
     public void Save()
     {
@@ -70,18 +95,56 @@ public class DeepSeekService
         }
 
         using var rootKey = Registry.CurrentUser.CreateSubKey(RegistryRootKey);
-        using var apisKey = rootKey.CreateSubKey(RegistryApisKey);
 
-        foreach (var name in apisKey.GetSubKeyNames())
+        // 阶段 1：合并——所有目标密钥先就位。
+        using (var apisKey = rootKey.CreateSubKey(RegistryApisKey))
         {
-            apisKey.DeleteSubKeyTree(name, false);
+            foreach (var api in Settings.Apis)
+            {
+                using var entryKey = apisKey.CreateSubKey(api.Id);
+                entryKey.SetValue(ValueApiKey, SecretProtector.Protect(api.ApiKey), RegistryValueKind.String);
+                // 脱敏串同样加密：注册表中不存在任何明文的密钥相关材料。
+                entryKey.SetValue(ValueMaskedKey, SecretProtector.Protect(api.MaskedKey), RegistryValueKind.String);
+            }
         }
 
-        foreach (var api in Settings.Apis)
+        // 阶段 2：备份——最后一份完整的良好状态。
+        ReplaceKey(rootKey, RegistryBackupKey,
+            Settings.Apis.Select(api => new KeyValuePair<string, (string ApiKey, string MaskedKey)>(
+                api.Id, (api.ApiKey, api.MaskedKey))));
+
+        // 阶段 3：剪枝——全部目标数据已落盘后，才删除陈旧子键。
+        using (var apisKey = rootKey.CreateSubKey(RegistryApisKey))
         {
-            using var entryKey = apisKey.CreateSubKey(api.Id);
-            entryKey.SetValue(ValueApiKey, SecretProtector.Protect(api.ApiKey), RegistryValueKind.String);
-            entryKey.SetValue(ValueMaskedKey, api.MaskedKey, RegistryValueKind.String);
+            var currentIds = Settings.Apis.Select(x => x.Id)
+                .ToHashSet(StringComparer.Ordinal);
+            foreach (var name in apisKey.GetSubKeyNames())
+            {
+                if (!currentIds.Contains(name))
+                {
+                    apisKey.DeleteSubKeyTree(name, false);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// 用给定条目整体重建一个子键：先删除旧子键，再逐条写入加密值。
+    /// 仅用于备份键等"可整体重建"的辅助键。
+    /// </summary>
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+    private static void ReplaceKey(
+        RegistryKey parent,
+        string keyName,
+        IEnumerable<KeyValuePair<string, (string ApiKey, string MaskedKey)>> entries)
+    {
+        parent.DeleteSubKeyTree(keyName, false);
+        using var container = parent.CreateSubKey(keyName);
+        foreach (var (id, values) in entries)
+        {
+            using var entryKey = container.CreateSubKey(id);
+            entryKey.SetValue(ValueApiKey, SecretProtector.Protect(values.ApiKey), RegistryValueKind.String);
+            entryKey.SetValue(ValueMaskedKey, SecretProtector.Protect(values.MaskedKey), RegistryValueKind.String);
         }
     }
 
@@ -93,33 +156,56 @@ public class DeepSeekService
 
     /// <summary>
     /// 校验密钥可用性，通过后添加到 API 列表。
+    /// 整个"去重→联网校验→写入"过程在锁内串行执行，防止相同密钥被并发重复添加。
     /// </summary>
     public async Task<(bool Ok, string Message)> TryAddApiAsync(string key)
     {
         key = key.Trim();
-
-        foreach (var api in Settings.Apis)
+        if (key.Length == 0)
         {
-            if (api.ApiKey == key)
+            return (false, "请输入 API 密钥。");
+        }
+
+        await _addLock.WaitAsync();
+        try
+        {
+            // 锁内再次检查：可能已有前一个并发请求完成了添加。
+            if (ContainsKey(key))
             {
                 return (false, "该密钥已存在于列表中。");
             }
-        }
 
-        var (ok, message, _) = await QueryAsync(key);
-        if (!ok)
-        {
-            return (false, message);
-        }
+            var (ok, message, _) = await QueryAsync(key);
+            if (!ok)
+            {
+                return (false, message);
+            }
 
-        Settings.Apis.Add(new DeepSeekApi
+            // 网络校验结束后再确认一次（锁内串行下理论上不可能变化，作为兜底）。
+            if (ContainsKey(key))
+            {
+                return (false, "该密钥已存在于列表中。");
+            }
+
+            Settings.Apis.Add(new DeepSeekApi
+            {
+                MaskedKey = Mask(key),
+                ApiKey = key
+            });
+            Save();
+            return (true, "验证通过，已添加到 API 列表。");
+        }
+        finally
         {
-            MaskedKey = Mask(key),
-            ApiKey = key
-        });
-        Save();
-        return (true, "验证通过，已添加到 API 列表。");
+            _addLock.Release();
+        }
     }
+
+    /// <summary>
+    /// 判断指定密钥是否已存在（大小写敏感的序号比较；DeepSeek 密钥区分大小写）。
+    /// </summary>
+    private bool ContainsKey(string key)
+        => Settings.Apis.Any(api => api.ApiKey == key);
 
     /// <summary>
     /// 从列表中删除指定的 API。
@@ -269,12 +355,28 @@ public class DeepSeekService
                     hasPlaintextEntry = true;
                 }
 
-                var maskedKey = entryKey.GetValue(ValueMaskedKey) as string;
+                var storedMasked = entryKey.GetValue(ValueMaskedKey) as string;
+                string maskedKey;
+                if (string.IsNullOrEmpty(storedMasked))
+                {
+                    maskedKey = Mask(apiKey);
+                }
+                else
+                {
+                    // 新版本中脱敏串也是密文；旧版本的明文脱敏串解密会失败并原样返回。
+                    var (decodedMasked, maskedEncrypted) = DecryptStored(storedMasked);
+                    maskedKey = decodedMasked;
+                    if (!maskedEncrypted)
+                    {
+                        hasPlaintextEntry = true;
+                    }
+                }
+
                 Settings.Apis.Add(new DeepSeekApi
                 {
                     Id = id,
                     ApiKey = apiKey,
-                    MaskedKey = string.IsNullOrEmpty(maskedKey) ? Mask(apiKey) : maskedKey
+                    MaskedKey = maskedKey
                 });
             }
 
@@ -288,9 +390,59 @@ public class DeepSeekService
     }
 
     /// <summary>
-    /// 解密注册表中存储的密钥，并识别旧版本写入的明文：
-    /// DeepSeek 密钥固定以 "sk-" 开头（密文为 DPAPI Base64，不会有此前缀）；
-    /// 非 sk- 开头但解密失败（损坏/换用户/换机器）时也按明文原值返回。
+    /// 从备份键恢复密钥到内存集合，并返回是否恢复出任意条目。
+    /// 仅在 Apis 主键整体缺失时调用：备份内容与主键格式相同（密文）。
+    /// </summary>
+    private bool LoadFromBackup()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return false;
+        }
+
+        try
+        {
+            using var backupKey = Registry.CurrentUser.OpenSubKey(
+                Path.Combine(RegistryRootKey, RegistryBackupKey));
+            if (backupKey is null)
+            {
+                return false;
+            }
+
+            foreach (var id in backupKey.GetSubKeyNames())
+            {
+                using var entryKey = backupKey.OpenSubKey(id);
+                if (entryKey?.GetValue(ValueApiKey) is not string stored ||
+                    string.IsNullOrEmpty(stored))
+                {
+                    continue;
+                }
+
+                var (apiKey, _) = DecryptStored(stored);
+                var (maskedKey, _) = entryKey.GetValue(ValueMaskedKey) is string storedMasked
+                    ? DecryptStored(storedMasked)
+                    : (Mask(apiKey), false);
+
+                Settings.Apis.Add(new DeepSeekApi
+                {
+                    Id = id,
+                    ApiKey = apiKey,
+                    MaskedKey = maskedKey
+                });
+            }
+
+            return Settings.Apis.Count > 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 解密注册表中存储的值，并识别旧版本写入的明文：
+    /// DeepSeek 完整密钥固定以 "sk-" 开头（DPAPI Base64 密文不会有此前缀），直接判为明文；
+    /// 其余值尝试 DPAPI 解密，失败（明文脱敏串/损坏/换用户/换机器）时按原值返回。
     /// </summary>
     private static (string ApiKey, bool IsEncrypted) DecryptStored(string stored)
     {
@@ -310,8 +462,10 @@ public class DeepSeekService
     }
 
     /// <summary>
-    /// 将旧 Settings.json 中的密钥按 Id 合并进注册表（已存在的 Id 不重复导入），
-    /// 随后销毁磁盘上的旧密钥文件。返回值表示是否在本过程中执行了加密保存。
+    /// 将旧 Settings.json 中的密钥合并进注册表，随后销毁磁盘上的旧密钥文件。
+    /// 同时按 Id 与完整密钥去重：已存在的 Id 跳过，密钥相同但 Id 不同同样跳过，
+    /// JSON 内部的重复条目也只保留一条，避免相同 API 重复导入。
+    /// 返回值表示是否在本过程中执行了加密保存。
     /// </summary>
     private bool MigrateLegacyIfNeeded(PluginSettings? legacy)
     {
@@ -322,17 +476,22 @@ public class DeepSeekService
 
         var existingIds = Settings.Apis.Select(x => x.Id)
             .ToHashSet(StringComparer.Ordinal);
+        var existingKeys = Settings.Apis.Select(x => x.ApiKey)
+            .ToHashSet(StringComparer.Ordinal);
         var hasNewEntry = false;
 
         foreach (var old in legacy.Apis)
         {
-            if (string.IsNullOrEmpty(old.ApiKey) || existingIds.Contains(old.Id))
+            if (string.IsNullOrEmpty(old.ApiKey) ||
+                existingIds.Contains(old.Id) ||
+                existingKeys.Contains(old.ApiKey))
             {
                 continue;
             }
 
             Settings.Apis.Add(old);
             existingIds.Add(old.Id);
+            existingKeys.Add(old.ApiKey);
             hasNewEntry = true;
         }
 
