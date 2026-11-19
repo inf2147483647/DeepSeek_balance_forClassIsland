@@ -1,4 +1,5 @@
-using System;
+﻿using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
@@ -39,19 +40,42 @@ public class DeepSeekService
     private readonly string _legacyConfigPath;
 
     /// <summary>
+    /// 余额阈值预警设置的持久化文件路径（非敏感数据，明文保存）。
+    /// </summary>
+    private readonly string _alertSettingsPath;
+
+    /// <summary>
     /// 串行化"校验+添加"流程，防止并发调用（如快速双击）绕过去重检查重复添加。
     /// </summary>
     private readonly SemaphoreSlim _addLock = new(1, 1);
+
+    /// <summary>
+    /// 各 API 上一次查询到的余额（按 API 的 Id 索引），用于判断本次是否发生变动。
+    /// </summary>
+    private readonly Dictionary<string, decimal> _lastBalances = new();
+
+    /// <summary>
+    /// 余额变动日志服务。
+    /// </summary>
+    public BalanceLogService Log { get; }
 
     /// <summary>
     /// 当前插件设置。
     /// </summary>
     public PluginSettings Settings { get; }
 
+    /// <summary>
+    /// 余额阈值预警设置。
+    /// </summary>
+    public DeepSeekAlertSettings AlertSettings { get; }
+
     public DeepSeekService(string configFolder)
     {
         _legacyConfigPath = Path.Combine(configFolder, "Settings.json");
+        _alertSettingsPath = Path.Combine(configFolder, "AlertSettings.json");
         Settings = new PluginSettings();
+        AlertSettings = LoadAlertSettings();
+        Log = new BalanceLogService(configFolder);
 
         // 加载顺序：
         //   1) 注册表主键 Apis（含旧版本写入的明文，将在后续重新加密）
@@ -218,6 +242,7 @@ public class DeepSeekService
 
     /// <summary>
     /// 获取指定 API 的余额（CNY）。失败时返回 null。
+    /// 若余额相较上次查询发生变动，则写入一条充值/消费日志。
     /// </summary>
     public async Task<decimal?> GetBalanceAsync(DeepSeekApi api)
     {
@@ -227,7 +252,43 @@ public class DeepSeekService
         }
 
         var (ok, _, balance) = await QueryAsync(api.ApiKey);
-        return ok ? balance : null;
+        if (!ok || balance is null)
+        {
+            return null;
+        }
+
+        RecordBalanceChange(api, balance.Value);
+        return balance;
+    }
+
+    /// <summary>
+    /// 仅当余额出现变化时记录一条日志；首次获取仅建立基线，不产生日志。
+    /// 日志写入失败不影响余额展示与刷新。
+    /// </summary>
+    private void RecordBalanceChange(DeepSeekApi api, decimal balance)
+    {
+        // 余额查询可能同时来自 UI 组件与预警提供方的后台轮询，需加锁保护共享状态。
+        lock (_lastBalances)
+        {
+            if (_lastBalances.TryGetValue(api.Id, out var previous) && previous != balance)
+            {
+                try
+                {
+                    Log.Append(api.MaskedKey, new BalanceLogEntry
+                    {
+                        Time = DateTime.Now,
+                        Delta = balance - previous,
+                        Balance = balance
+                    });
+                }
+                catch
+                {
+                    // 忽略日志写入异常。
+                }
+            }
+
+            _lastBalances[api.Id] = balance;
+        }
     }
 
     /// <summary>
@@ -301,6 +362,42 @@ public class DeepSeekService
         catch
         {
             return null;
+        }
+    }
+
+    /// <summary>
+    /// 读取余额阈值预警设置；文件不存在或读取失败时返回默认设置。
+    /// </summary>
+    private DeepSeekAlertSettings LoadAlertSettings()
+    {
+        try
+        {
+            if (!File.Exists(_alertSettingsPath))
+            {
+                return new DeepSeekAlertSettings();
+            }
+
+            return ConfigureFileHelper.LoadConfig<DeepSeekAlertSettings>(_alertSettingsPath)
+                ?? new DeepSeekAlertSettings();
+        }
+        catch
+        {
+            return new DeepSeekAlertSettings();
+        }
+    }
+
+    /// <summary>
+    /// 保存余额阈值预警设置。保存失败不影响预警功能在当前会话中的使用。
+    /// </summary>
+    public void SaveAlertSettings()
+    {
+        try
+        {
+            ConfigureFileHelper.SaveConfig(_alertSettingsPath, AlertSettings);
+        }
+        catch
+        {
+            // 忽略保存异常。
         }
     }
 

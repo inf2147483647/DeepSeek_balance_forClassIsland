@@ -3,6 +3,7 @@ using ClassIsland.Core.Attributes;
 using ClassIsland.Core.Extensions.Registry;
 using DeepSeekBalance.Components;
 using DeepSeekBalance.Services;
+using DeepSeekBalance.Services.NotificationProviders;
 using DeepSeekBalance.Views;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -33,6 +34,7 @@ public class Plugin : PluginBase
         services.AddSingleton(Service);
 
         services.AddComponent<DeepSeekBalanceComponent, DeepSeekComponentSettingsControl>();
+        services.AddNotificationProvider<DeepSeekAlertNotificationProvider, DeepSeekAlertNotificationSettingsControl>();
         services.AddSettingsPage<DeepSeekPluginSettingsPage>();
     }
 }
